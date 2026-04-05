@@ -56,7 +56,7 @@ step: [90, 130]          # epoch milestones for LR decay
 # ─────────────────────────────────────────────────────────────────────────────
 # Training schedule
 # ─────────────────────────────────────────────────────────────────────────────
-device: 4
+device: 4  # GPU device index used for training and inference (single GPU)
 batch_size: 32
 test_batch_size: 32
 num_epoch: 150

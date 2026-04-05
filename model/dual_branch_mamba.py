@@ -354,12 +354,12 @@ class SelectiveSSM(nn.Module):
         # B_bar : (B, L, d_inner, d_state)
         B_bar = delta.unsqueeze(-1) * B_param.unsqueeze(2)
 
-        # Sequential scan  h_t = A_bar_t * h_{t-1} + B_bar_t * u_t
-        h = x.new_zeros(B, d_inner, d_state)
+        # Sequential scan  state_t = A_bar_t * state_{t-1} + B_bar_t * u_t
+        state = x.new_zeros(B, d_inner, d_state)
         ys = []
         for i in range(L):
-            h = A_bar[:, i] * h + B_bar[:, i] * x[:, i].unsqueeze(-1)
-            y_i = (h * C_param[:, i].unsqueeze(1)).sum(-1)  # (B, d_inner)
+            state = A_bar[:, i] * state + B_bar[:, i] * x[:, i].unsqueeze(-1)
+            y_i = (state * C_param[:, i].unsqueeze(1)).sum(-1)  # (B, d_inner)
             ys.append(y_i)
         y = torch.stack(ys, dim=1)              # (B, L, d_inner)
         y = y + x * D                           # skip connection
@@ -647,9 +647,10 @@ class Model(nn.Module):
         self.drop_out = nn.Dropout(drop_out) if drop_out else lambda x: x
 
     def forward(self, x):
-        # Support both (N, T, V*C) and (N, C, T, V, M) inputs
+        # Support both (N, T, V*C) flat input and canonical (N, C, T, V, M) input
         if len(x.shape) == 3:
             N, T, VC = x.shape
+            # Reshape: (N, T, V*C) → (N, C, T, V, M=1)
             x = x.view(N, T, self.num_point, -1).permute(0, 3, 1, 2).contiguous().unsqueeze(-1)
         N, C, T, V, M = x.size()
 
