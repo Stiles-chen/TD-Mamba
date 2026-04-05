@@ -6,7 +6,7 @@ Architecture:
                   relationships using the skeleton graph adjacency matrix.
   - Mamba branch: SpatialMamba models global spatial dependencies by
                   scanning over the joint sequence with a bidirectional
-                  selective state-space model (pure PyTorch, no C extension).
+                  Mamba SSM (backed by the official mamba-ssm CUDA kernel).
   - Gate fusion : a learnable sigmoid gate adaptively blends the two
                   complementary feature streams.
   - TCN         : MultiScale_TemporalConv captures multi-scale temporal
@@ -14,6 +14,8 @@ Architecture:
 
 Input/output contract is identical to model.tdgcn.Model so that the
 existing training pipeline (main.py) and SHREC17 feeder require no changes.
+
+Requires: pip install mamba-ssm  (CUDA ≥ 11.6, PyTorch ≥ 1.12)
 
 Input  : (N, C, T, V, M)  –  batch, channels, time, joints, persons
 Output : (N, num_class)
@@ -26,6 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
+from mamba_ssm import Mamba
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Utility helpers (identical to tdgcn.py)
@@ -262,135 +265,9 @@ class unit_gcn(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Mamba-style SSM – pure PyTorch, no CUDA extension required
+# Mamba SSM – backed by the official mamba-ssm CUDA kernel
+# (SelectiveSSM has been replaced by mamba_ssm.Mamba)
 # ──────────────────────────────────────────────────────────────────────────────
-
-class SelectiveSSM(nn.Module):
-    """
-    Minimal selective state-space model (Mamba-style, Gu & Dao 2023).
-
-    Operates over a 1-D sequence of length L.  When applied to skeleton data
-    L = V (number of joints), so the scan captures global spatial dependencies
-    across all joints in a single frame.
-
-    The implementation is a pure-PyTorch sequential scan; with V ≤ 22 joints
-    this is fast regardless of batch size.
-
-    Args:
-        d_model  : input / output feature dimension
-        d_state  : SSM state dimension (default 16)
-        d_conv   : depthwise-conv kernel size along the sequence (default 4)
-        expand   : inner-dimension expansion factor (default 2)
-        dt_rank  : rank of the Δ projection; defaults to ceil(d_model / 16)
-    """
-
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dt_rank=None):
-        super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.expand = expand
-        self.d_inner = int(d_model * expand)
-        self.dt_rank = max(1, math.ceil(d_model / 16)) if dt_rank is None else dt_rank
-
-        # Input projection: splits into x (signal) and z (gate)
-        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
-
-        # Depthwise 1-D conv along the sequence axis
-        self.conv1d = nn.Conv1d(
-            self.d_inner, self.d_inner,
-            kernel_size=d_conv, padding=d_conv - 1,
-            groups=self.d_inner, bias=True)
-
-        # Projects x → (Δ, B, C) for the selective mechanism
-        self.x_proj = nn.Linear(
-            self.d_inner, self.dt_rank + d_state * 2, bias=False)
-
-        # Projects low-rank Δ to full inner-dimension step size
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
-
-        # A matrix (diagonal, stored in log-space for numerical stability)
-        A = (torch.arange(1, d_state + 1, dtype=torch.float32)
-             .unsqueeze(0).expand(self.d_inner, -1))
-        self.A_log = nn.Parameter(torch.log(A))
-
-        # Skip-connection scale
-        self.D = nn.Parameter(torch.ones(self.d_inner))
-
-        # Output projection
-        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
-
-        # Pre-norm
-        self.norm = nn.LayerNorm(d_model)
-
-    # ------------------------------------------------------------------
-    def _ssm_scan(self, x, A_log, D):
-        """
-        Sequential selective scan.
-
-        x     : (B, L, d_inner)  – after conv + activation
-        A_log : (d_inner, d_state)
-        D     : (d_inner,)
-        Returns y of shape (B, L, d_inner).
-        """
-        B, L, d_inner = x.shape
-        d_state = A_log.shape[-1]
-
-        # Negative A for stability  (A_log holds log|A|, A should be negative)
-        A = -torch.exp(A_log.float())           # (d_inner, d_state)
-
-        # Compute Δ, B_param, C_param from x  (the "selective" part)
-        x_dbc = self.x_proj(x)                  # (B, L, dt_rank + 2*d_state)
-        delta_raw, B_param, C_param = x_dbc.split(
-            [self.dt_rank, d_state, d_state], dim=-1)
-        delta = F.softplus(self.dt_proj(delta_raw))  # (B, L, d_inner)
-
-        # Zero-order-hold (ZOH) discretisation
-        # A_bar : (B, L, d_inner, d_state)
-        A_bar = torch.exp(
-            delta.unsqueeze(-1) *
-            A.unsqueeze(0).unsqueeze(0))
-
-        # B_bar : (B, L, d_inner, d_state)
-        B_bar = delta.unsqueeze(-1) * B_param.unsqueeze(2)
-
-        # Sequential scan  state_t = A_bar_t * state_{t-1} + B_bar_t * u_t
-        state = x.new_zeros(B, d_inner, d_state)
-        ys = []
-        for i in range(L):
-            state = A_bar[:, i] * state + B_bar[:, i] * x[:, i].unsqueeze(-1)
-            y_i = (state * C_param[:, i].unsqueeze(1)).sum(-1)  # (B, d_inner)
-            ys.append(y_i)
-        y = torch.stack(ys, dim=1)              # (B, L, d_inner)
-        y = y + x * D                           # skip connection
-        return y
-
-    # ------------------------------------------------------------------
-    def forward(self, hidden_states):
-        """
-        hidden_states : (B, L, d_model)
-        Returns       : (B, L, d_model)  with residual added
-        """
-        residual = hidden_states
-        hidden_states = self.norm(hidden_states)
-
-        # Input projection → split into signal x and gate z
-        xz = self.in_proj(hidden_states)        # (B, L, 2*d_inner)
-        x, z = xz.chunk(2, dim=-1)              # each (B, L, d_inner)
-
-        # Depthwise conv over L (trim causal-padding tail)
-        x_conv = self.conv1d(x.transpose(1, 2))[:, :, :x.shape[1]]
-        x_conv = x_conv.transpose(1, 2)         # (B, L, d_inner)
-        x_conv = F.silu(x_conv)
-
-        # SSM scan
-        y = self._ssm_scan(x_conv, self.A_log, self.D)
-
-        # Multiplicative gate
-        y = y * F.silu(z)
-
-        # Output projection + residual
-        return self.out_proj(y) + residual
 
 
 class SpatialMamba(nn.Module):
@@ -417,10 +294,12 @@ class SpatialMamba(nn.Module):
     def __init__(self, channels, d_state=16, d_conv=4, expand=2):
         super().__init__()
         self.channels = channels
-        self.ssm_fwd = SelectiveSSM(channels, d_state=d_state,
-                                    d_conv=d_conv, expand=expand)
-        self.ssm_bwd = SelectiveSSM(channels, d_state=d_state,
-                                    d_conv=d_conv, expand=expand)
+        # Official mamba-ssm.Mamba: includes input projection, conv1d, SSM scan,
+        # output projection and residual – all fused in a single CUDA kernel.
+        self.ssm_fwd = Mamba(d_model=channels, d_state=d_state,
+                             d_conv=d_conv, expand=expand)
+        self.ssm_bwd = Mamba(d_model=channels, d_state=d_state,
+                             d_conv=d_conv, expand=expand)
         # Fuse forward and backward outputs
         self.fuse_proj = nn.Sequential(
             nn.Linear(channels * 2, channels, bias=False),
