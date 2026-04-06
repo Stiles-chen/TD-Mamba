@@ -7,7 +7,7 @@ import random
 class Feeder(Dataset):
     def __init__(self, data_path, label_path, repeat=1, label_flag=28, random_choose=True, random_shift=False, random_move=False,
                  window_size=180, normalization=False, debug=False, use_mmap=True):
-        self.nw_hand17_root = 'data/shrec/shrec17_jsons/'
+        self.nw_hand17_root = '../data/shrec/shrec17_jsons/'
 
         if 'val' in label_path:  
             self.train_val = 'val'
