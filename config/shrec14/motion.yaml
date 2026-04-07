@@ -26,7 +26,7 @@ test_feeder_args:
 # ─────────────────────────────────────────────────────────────────────────────
 # Model: Dual-Branch GCN + Mamba (drop-in replacement for model.tdgcn.Model)
 # ─────────────────────────────────────────────────────────────────────────────
-model: model.tdmamba.Model
+model: model.tdmambav1.Model
 model_args:
   num_class: 14          # 28-class SHREC17 (change to 14 for 14-class split)
   num_point: 22          # SHREC17 skeleton has 22 hand joints
@@ -41,6 +41,7 @@ model_args:
   # Mamba settings
   d_state: 16            # SSM state dimension; increase to 32 for richer model
   mamba_expand: 2        # inner-dim expansion factor (d_inner = 2 * channels)
+  mamba_start_layer: 5   # stage index to start Mamba (0-based; set to 0 to apply Mamba from the first stage)
 
   in_channels: 3         # 3-D joint coordinates (x, y, z)
   drop_out: 0.25         # dropout before classifier (helps on small datasets)
@@ -57,8 +58,8 @@ step: [90, 130]          # epoch milestones for LR decay
 # Training schedule
 # ─────────────────────────────────────────────────────────────────────────────
 device: 0  # GPU device index used for training and inference (single GPU)
-batch_size: 32
-test_batch_size: 32
+batch_size: 64
+test_batch_size: 64
 num_epoch: 150
 nesterov: True
 warm_up_epoch: 20

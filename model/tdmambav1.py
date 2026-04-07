@@ -20,7 +20,7 @@ Requires: pip install mamba-ssm  (CUDA ≥ 11.6, PyTorch ≥ 1.12)
 Input  : (N, C, T, V, M)  –  batch, channels, time, joints, persons
 Output : (N, num_class)
 """
-
+#加入了手动控制哪层开始使用mamba
 import math
 
 import numpy as np
@@ -457,6 +457,38 @@ class DualBranchBlock(nn.Module):
         return out
 
 
+class GCNOnlyBlock(nn.Module):
+    """GCN+TCN block used when Mamba is disabled for a given layer."""
+
+    def __init__(self, in_channels, out_channels, A,
+                 stride=1, residual=True, adaptive=True,
+                 kernel_size=5, dilations=None):
+        super().__init__()
+        if dilations is None:
+            dilations = [1, 2]
+
+        self.gcn = unit_gcn(in_channels, out_channels, A, adaptive=adaptive)
+        self.tcn = MultiScale_TemporalConv(
+            out_channels, out_channels,
+            kernel_size=kernel_size, stride=stride,
+            dilations=dilations, residual=False)
+
+        if not residual:
+            self.residual = lambda x: 0
+        elif (in_channels == out_channels) and (stride == 1):
+            self.residual = lambda x: x
+        else:
+            self.residual = unit_tcn(in_channels, out_channels,
+                                     kernel_size=1, stride=stride)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        res = self.residual(x)
+        out = self.tcn(self.gcn(x))
+        out = self.relu(out + res)
+        return out
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Full model
 # ──────────────────────────────────────────────────────────────────────────────
@@ -484,12 +516,38 @@ class Model(nn.Module):
         adaptive    : use learnable adjacency in GCN
         d_state     : Mamba SSM state dimension
         mamba_expand: Mamba inner-dim expansion factor
+        mamba_start_layer: enable Mamba from this layer index (1..10), inclusive
+        mamba_layers: explicit list of layer indices (1..10) that use Mamba;
+                      if provided, it overrides mamba_start_layer
     """
+
+    TOTAL_LAYERS = 10
+
+    @staticmethod
+    def _resolve_mamba_layers(mamba_start_layer, mamba_layers):
+        """Resolve enabled Mamba layers with 1-based indexing (l1..l10)."""
+        if mamba_layers is not None:
+            if not isinstance(mamba_layers, (list, tuple, set)):
+                raise TypeError("mamba_layers must be a list/tuple/set of layer indices")
+            layers = {int(i) for i in mamba_layers}
+        elif mamba_start_layer is not None:
+            start = int(mamba_start_layer)
+            if start < 1 or start > Model.TOTAL_LAYERS:
+                raise ValueError("mamba_start_layer must be in [1, 10]")
+            layers = set(range(start, Model.TOTAL_LAYERS + 1))
+        else:
+            layers = set(range(1, Model.TOTAL_LAYERS + 1))
+
+        invalid = sorted(i for i in layers if i < 1 or i > Model.TOTAL_LAYERS)
+        if invalid:
+            raise ValueError("mamba layer indices must be in [1, 10], got {}".format(invalid))
+        return layers
 
     def __init__(self, num_class=60, num_point=25, num_person=2,
                  graph=None, graph_args=None, in_channels=3,
                  drop_out=0, adaptive=True,
-                 d_state=16, mamba_expand=2):
+                 d_state=16, mamba_expand=2,
+                 mamba_start_layer=None, mamba_layers=None):
         super(Model, self).__init__()
 
         if graph_args is None:
@@ -507,17 +565,36 @@ class Model(nn.Module):
 
         base_channel = 64
         kw = dict(adaptive=adaptive, d_state=d_state, mamba_expand=mamba_expand)
+        self.mamba_layers = sorted(self._resolve_mamba_layers(mamba_start_layer, mamba_layers))
 
-        self.l1 = DualBranchBlock(in_channels, base_channel, A, residual=False, **kw)
-        self.l2 = DualBranchBlock(base_channel, base_channel, A, **kw)
-        self.l3 = DualBranchBlock(base_channel, base_channel, A, **kw)
-        self.l4 = DualBranchBlock(base_channel, base_channel, A, **kw)
-        self.l5 = DualBranchBlock(base_channel, base_channel * 2, A, stride=2, **kw)
-        self.l6 = DualBranchBlock(base_channel * 2, base_channel * 2, A, **kw)
-        self.l7 = DualBranchBlock(base_channel * 2, base_channel * 2, A, **kw)
-        self.l8 = DualBranchBlock(base_channel * 2, base_channel * 4, A, stride=2, **kw)
-        self.l9 = DualBranchBlock(base_channel * 4, base_channel * 4, A, **kw)
-        self.l10 = DualBranchBlock(base_channel * 4, base_channel * 4, A, **kw)
+        layer_specs = [
+            (in_channels, base_channel, 1, False),
+            (base_channel, base_channel, 1, True),
+            (base_channel, base_channel, 1, True),
+            (base_channel, base_channel, 1, True),
+            (base_channel, base_channel * 2, 2, True),
+            (base_channel * 2, base_channel * 2, 1, True),
+            (base_channel * 2, base_channel * 2, 1, True),
+            (base_channel * 2, base_channel * 4, 2, True),
+            (base_channel * 4, base_channel * 4, 1, True),
+            (base_channel * 4, base_channel * 4, 1, True),
+        ]
+
+        self.layer_names = []
+        for idx, (in_c, out_c, stride, residual) in enumerate(layer_specs, start=1):
+            if idx in self.mamba_layers:
+                block = DualBranchBlock(
+                    in_c, out_c, A,
+                    stride=stride, residual=residual,
+                    **kw)
+            else:
+                block = GCNOnlyBlock(
+                    in_c, out_c, A,
+                    stride=stride, residual=residual,
+                    adaptive=adaptive)
+            name = "l{}".format(idx)
+            setattr(self, name, block)
+            self.layer_names.append(name)
 
         self.fc = nn.Linear(base_channel * 4, num_class)
         nn.init.normal_(self.fc.weight, 0, math.sqrt(2. / num_class))
@@ -538,16 +615,8 @@ class Model(nn.Module):
         x = self.data_bn(x)
         x = x.view(N, M, V, C, T).permute(0, 1, 3, 4, 2).contiguous().view(N * M, C, T, V)
 
-        x = self.l1(x)
-        x = self.l2(x)
-        x = self.l3(x)
-        x = self.l4(x)
-        x = self.l5(x)
-        x = self.l6(x)
-        x = self.l7(x)
-        x = self.l8(x)
-        x = self.l9(x)
-        x = self.l10(x)
+        for name in self.layer_names:
+            x = getattr(self, name)(x)
 
         # Global average pooling over time and joints, then classify
         c_new = x.size(1)
