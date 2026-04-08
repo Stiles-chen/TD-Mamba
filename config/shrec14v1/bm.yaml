@@ -54,6 +54,7 @@ weight_decay: 0.0001
 base_lr: 0.1
 lr_decay_rate: 0.1
 step: [90, 130]          # epoch milestones for LR decay
+gate_lr_mult: 3.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training schedule

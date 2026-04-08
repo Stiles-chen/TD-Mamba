@@ -5,7 +5,7 @@
 # feeder
 feeder: feeders.feeder_shrec17.Feeder
 train_feeder_args:
-  data_path: bone_motion       # modality: joint | bone | motion | bone_motion
+  data_path: motion       # modality: joint | bone | motion | bone_motion
   label_path: train
   debug: False
   random_choose: True
@@ -17,7 +17,7 @@ train_feeder_args:
   label_flag: 14         # 14-class or 28-class split
 
 test_feeder_args:
-  data_path: bone_motion
+  data_path: motion
   label_path: val
   debug: False
   label_flag: 14
@@ -26,7 +26,7 @@ test_feeder_args:
 # ─────────────────────────────────────────────────────────────────────────────
 # Model: Dual-Branch GCN + Mamba (drop-in replacement for model.tdgcn.Model)
 # ─────────────────────────────────────────────────────────────────────────────
-model: model.tdmamba.Model
+model: model.tdmambav1.Model
 model_args:
   num_class: 14          # 28-class SHREC17 (change to 14 for 14-class split)
   num_point: 22          # SHREC17 skeleton has 22 hand joints
@@ -43,7 +43,6 @@ model_args:
   mamba_expand: 2        # inner-dim expansion factor (d_inner = 2 * channels)
   mamba_start_layer: 5   # stage index to start Mamba (0-based; set to 0 to apply Mamba from the first stage)
 
-
   in_channels: 3         # 3-D joint coordinates (x, y, z)
   drop_out: 0.25         # dropout before classifier (helps on small datasets)
 
@@ -54,6 +53,7 @@ weight_decay: 0.0001
 base_lr: 0.1
 lr_decay_rate: 0.1
 step: [90, 130]          # epoch milestones for LR decay
+gate_lr_mult: 3.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training schedule
@@ -65,4 +65,4 @@ num_epoch: 150
 nesterov: True
 warm_up_epoch: 20
 
-work_dir: ./work_dir/shrec17/14bone_motion
+work_dir: ./work_dir/shrec17/14motion
