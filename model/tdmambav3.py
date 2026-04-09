@@ -565,8 +565,8 @@ class DualBranchBlock(nn.Module):
                  stride=1, residual=True, adaptive=True,
                  kernel_size=5, dilations=None,
                  d_state=16, mamba_expand=2,
-                 use_hyper_order=False, num_nodes=25,
-                 hyper_num_edges=None, hyper_alpha_init=0.1):
+                 use_hyper_order=True, num_nodes=25,
+                 hyper_num_edges=7, hyper_alpha_init=0.1):
         super().__init__()
         if dilations is None:
             dilations = [1, 2]
