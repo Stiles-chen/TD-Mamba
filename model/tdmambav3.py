@@ -334,7 +334,7 @@ class HyperGraphConvLite(nn.Module):
         self.bn = nn.BatchNorm2d(channels)
         self.act = nn.ReLU(inplace=True)
 
-        # Initialise weights consistently with the rest of the codebase
+        # Initialize weights consistently with the rest of the codebase
         nn.init.kaiming_normal_(self.node_to_edge[0].weight, mode='fan_out')
         nn.init.kaiming_normal_(self.edge_transform.weight, mode='fan_out')
         nn.init.kaiming_normal_(self.node_update.weight, mode='fan_out')
@@ -355,7 +355,7 @@ class HyperGraphConvLite(nn.Module):
         x_pool_t = x_pool.permute(0, 2, 1)        # (NM, V, C)
         H = self.node_to_edge(x_pool_t)           # (NM, V, E)  ∈ (0,1), rows sum to 1
 
-        # Degree normalisers
+        # Degree normalizers
         d_v = H.sum(dim=-1).clamp(min=1e-6)       # node degree (NM, V)
         d_e = H.sum(dim=1).clamp(min=1e-6)        # edge degree (NM, E)
 
@@ -369,12 +369,12 @@ class HyperGraphConvLite(nn.Module):
 
         # Node → Hyperedge  :  X_e = D_e^{-1} H^T X
         X_e = torch.bmm(H_t.transpose(1, 2), x_tv)     # (NM*T, E, C)
-        X_e = X_e / d_e_t                               # normalise by edge degree
+        X_e = X_e / d_e_t                               # normalize by edge degree
         X_e = self.edge_transform(X_e)                  # (NM*T, E, C)
 
         # Hyperedge → Node  :  X' = D_v^{-1} H X_e
         X_node = torch.bmm(H_t, X_e)                    # (NM*T, V, C)
-        X_node = X_node / d_v_t                         # normalise by node degree
+        X_node = X_node / d_v_t                         # normalize by node degree
         X_node = self.node_update(X_node)               # (NM*T, V, C)
 
         # Reshape back to (NM, C, T, V)
