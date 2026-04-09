@@ -267,6 +267,161 @@ class unit_gcn(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Hypergraph-guided node ordering helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _batched_reorder_v(x, idx):
+    """
+    Reorder the V (joint) dimension of x using per-sample indices.
+
+    x   : (NM, C, T, V)
+    idx : (NM, V)  – permutation indices along the V dimension
+    Returns: (NM, C, T, V) with joints reordered according to idx.
+    """
+    NM, C, T, V = x.shape
+    idx_exp = idx[:, None, None, :].expand(NM, C, T, V)
+    return torch.gather(x, dim=3, index=idx_exp)
+
+
+def _batched_inverse_permutation(perm):
+    """
+    Compute the inverse of a batch of permutations.
+
+    perm : (NM, V)
+    Returns inv_perm : (NM, V)  such that  inv_perm[b, perm[b, i]] = i
+    """
+    NM, V = perm.shape
+    inv = torch.empty_like(perm)
+    arange = torch.arange(V, device=perm.device).unsqueeze(0).expand(NM, V)
+    inv.scatter_(1, perm, arange)
+    return inv
+
+
+class HyperGraphConvLite(nn.Module):
+    """
+    Lightweight per-sample hypergraph convolution.
+
+    Builds a dynamic soft incidence matrix H ∈ [0,1]^{V×E} from time-pooled
+    node features, then performs one round of hypergraph message passing:
+
+        node → hyperedge aggregation : X_e = D_e^{-1} H^T X
+        hyperedge → node update      : X'  = D_v^{-1} H  X_e
+
+    This approximates the HyperGraphConv used in DSTSA-Hypergraph while
+    keeping the implementation self-contained (no external graph library).
+
+    Args:
+        channels  : feature channel dimension C
+        num_nodes : number of skeleton joints V
+        num_edges : number of hyperedges E (default: num_nodes)
+    """
+
+    def __init__(self, channels, num_nodes, num_edges=None):
+        super().__init__()
+        if num_edges is None:
+            num_edges = num_nodes
+        self.num_edges = num_edges
+
+        # Learnable projection: node feature → soft membership over E hyperedges
+        self.node_to_edge = nn.Sequential(
+            nn.Linear(channels, num_edges, bias=False),
+            nn.Softmax(dim=-1),          # each node distributes weight across edges
+        )
+        # Hyperedge feature transformation
+        self.edge_transform = nn.Linear(channels, channels, bias=False)
+        # Node update projection after receiving hyperedge messages
+        self.node_update = nn.Linear(channels, channels, bias=False)
+        self.bn = nn.BatchNorm2d(channels)
+        self.act = nn.ReLU(inplace=True)
+
+        # Initialize weights consistently with the rest of the codebase
+        nn.init.kaiming_normal_(self.node_to_edge[0].weight, mode='fan_out')
+        nn.init.kaiming_normal_(self.edge_transform.weight, mode='fan_out')
+        nn.init.kaiming_normal_(self.node_update.weight, mode='fan_out')
+        bn_init(self.bn, 1)
+
+    def forward(self, x):
+        """
+        x : (NM, C, T, V)
+        Returns:
+            x_hyper : (NM, C, T, V) – hypergraph-convolved features
+            H       : (NM, V, E)    – soft incidence matrix (for degree routing)
+        """
+        NM, C, T, V = x.shape
+        E = self.num_edges
+
+        # Build per-sample incidence matrix from time-averaged node features
+        x_pool = x.mean(dim=2)                    # (NM, C, V)
+        x_pool_t = x_pool.permute(0, 2, 1)        # (NM, V, C)
+        H = self.node_to_edge(x_pool_t)           # (NM, V, E)  ∈ (0,1), rows sum to 1
+
+        # Degree normalizers
+        d_v = H.sum(dim=-1).clamp(min=1e-6)       # node degree (NM, V)
+        d_e = H.sum(dim=1).clamp(min=1e-6)        # edge degree (NM, E)
+
+        # Expand H and degrees over the time dimension for batched bmm
+        H_t   = H.unsqueeze(1).expand(NM, T, V, E).reshape(NM * T, V, E)
+        d_v_t = d_v.unsqueeze(1).expand(NM, T, V).reshape(NM * T, V, 1)
+        d_e_t = d_e.unsqueeze(1).expand(NM, T, E).reshape(NM * T, E, 1)
+
+        # Flatten time into batch for message passing
+        x_tv = x.permute(0, 2, 3, 1).contiguous().view(NM * T, V, C)   # (NM*T, V, C)
+
+        # Node → Hyperedge  :  X_e = D_e^{-1} H^T X
+        X_e = torch.bmm(H_t.transpose(1, 2), x_tv)     # (NM*T, E, C)
+        X_e = X_e / d_e_t                               # normalize by edge degree
+        X_e = self.edge_transform(X_e)                  # (NM*T, E, C)
+
+        # Hyperedge → Node  :  X' = D_v^{-1} H X_e
+        X_node = torch.bmm(H_t, X_e)                    # (NM*T, V, C)
+        X_node = X_node / d_v_t                         # normalize by node degree
+        X_node = self.node_update(X_node)               # (NM*T, V, C)
+
+        # Reshape back to (NM, C, T, V)
+        x_hyper = X_node.view(NM, T, V, C).permute(0, 3, 1, 2).contiguous()
+        x_hyper = self.act(self.bn(x_hyper))
+
+        return x_hyper, H
+
+
+class DegreeOrderRouter(nn.Module):
+    """
+    Computes per-sample node orderings based on hypergraph node degree.
+
+    Nodes with higher degree (more hyperedge participation, i.e. more
+    structurally central joints) are placed first so that the Mamba SSM
+    sees the most information-rich joints at the start of its scan.
+
+    Args:
+        tie_break_range : magnitude of fixed per-node offset added to break
+                          ties deterministically without random noise.
+    """
+
+    def __init__(self, tie_break_range=1e-6):
+        super().__init__()
+        self.tie_break_range = tie_break_range
+
+    def forward(self, H):
+        """
+        H : (NM, V, E)  – soft incidence matrix from HyperGraphConvLite
+        Returns:
+            perm     : (NM, V) – descending-degree permutation indices
+            inv_perm : (NM, V) – inverse permutation (for restoring order)
+            deg      : (NM, V) – raw node degrees
+        """
+        deg = H.sum(dim=-1).float()    # (NM, V) – node degree
+        V = deg.shape[1]
+
+        # Fixed small per-node tie-breaker (no randomness → stable across steps)
+        tie = torch.linspace(0, self.tie_break_range, V, device=deg.device)
+        score = deg + tie.unsqueeze(0)
+
+        perm = torch.argsort(score, dim=1, descending=True)   # (NM, V)
+        inv_perm = _batched_inverse_permutation(perm)
+        return perm, inv_perm, deg
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Mamba SSM – backed by the official mamba-ssm CUDA kernel
 # (SelectiveSSM has been replaced by mamba_ssm.Mamba)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -380,32 +535,60 @@ class DualBranchBlock(nn.Module):
     Input / output shape: (N*M, C_in, T, V) → (N*M, C_out, T', V)
     where T' = T // stride.
 
+    Optional hypergraph-guided ordering (enabled via use_hyper_order=True):
+      - HyperGraphConvLite builds a per-sample soft incidence matrix H.
+      - Node features are enriched: x_fused = x + hyper_alpha * x_hyper.
+      - Node degree computed from H determines the Mamba scan order.
+      - SpatialMamba scans degree-sorted joints; original order is restored
+        via the inverse permutation after the scan.
+      - The GCN branch always uses the original (unsorted) node ordering.
+
     Args:
-        in_channels  : input channel dimension
-        out_channels : output channel dimension
-        A            : adjacency matrix (num_subset, V, V)
-        stride       : temporal downsampling factor (default 1)
-        residual     : whether to use a residual skip connection
-        adaptive     : whether GCN uses learnable adjacency
-        kernel_size  : TCN kernel size
-        dilations    : TCN dilation list
-        d_state      : Mamba SSM state size
-        mamba_expand : Mamba inner-dim expansion factor
+        in_channels     : input channel dimension
+        out_channels    : output channel dimension
+        A               : adjacency matrix (num_subset, V, V)
+        stride          : temporal downsampling factor (default 1)
+        residual        : whether to use a residual skip connection
+        adaptive        : whether GCN uses learnable adjacency
+        kernel_size     : TCN kernel size
+        dilations       : TCN dilation list
+        d_state         : Mamba SSM state size
+        mamba_expand    : Mamba inner-dim expansion factor
+        use_hyper_order : enable hypergraph-guided node ordering (default False)
+        num_nodes       : number of skeleton joints V (required when
+                          use_hyper_order=True)
+        hyper_num_edges : number of hyperedges E (default: num_nodes)
+        hyper_alpha_init: initial value of the learnable fusion coefficient α
     """
 
     def __init__(self, in_channels, out_channels, A,
                  stride=1, residual=True, adaptive=True,
                  kernel_size=5, dilations=None,
-                 d_state=16, mamba_expand=2):
+                 d_state=16, mamba_expand=2,
+                 use_hyper_order=False, num_nodes=25,
+                 hyper_num_edges=None, hyper_alpha_init=0.1):
         super().__init__()
         if dilations is None:
             dilations = [1, 2]
 
+        self.use_hyper_order = use_hyper_order
+
+        # Hypergraph modules – only instantiated when the feature is enabled
+        if use_hyper_order:
+            if hyper_num_edges is None:
+                hyper_num_edges = num_nodes
+            self.hyper_conv = HyperGraphConvLite(
+                in_channels, num_nodes, hyper_num_edges)
+            self.hyper_router = DegreeOrderRouter()
+            # Learnable fusion coefficient α (small init keeps early training stable)
+            self.hyper_alpha = nn.Parameter(
+                torch.tensor(hyper_alpha_init, dtype=torch.float32))
+
         # GCN branch
         self.gcn = unit_gcn(in_channels, out_channels, A, adaptive=adaptive)
 
-        # Mamba branch – receives the *input* x, not the GCN output,
-        # so both branches process the same representation independently.
+        # Mamba branch – receives the *input* x (or its hypergraph-fused version),
+        # not the GCN output, so both branches process the same representation.
         self.mamba = SpatialMamba(in_channels, d_state=d_state,
                                   expand=mamba_expand)
 
@@ -440,21 +623,39 @@ class DualBranchBlock(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        # (N*M, C_in, T, V)
+        # x: (N*M, C_in, T, V)
         res = self.residual(x)
 
-        # GCN branch
-        f_gcn = self.gcn(x)                  # (N*M, C_out, T, V)
+        # GCN branch – always uses original (unsorted) node ordering
+        f_gcn = self.gcn(x)                         # (N*M, C_out, T, V)
 
-        # Mamba branch
-        f_mamba = self.mamba(x)              # (N*M, C_in, T, V)
-        f_mamba = self.mamba_proj(f_mamba)   # (N*M, C_out, T, V)
+        # Mamba branch with optional hypergraph-guided node ordering
+        if self.use_hyper_order:
+            # 1. Build per-sample hypergraph and enrich features (residual form)
+            x_hyper, H = self.hyper_conv(x)         # x_hyper: (NM, C_in, T, V)
+            x_for_mamba = x + self.hyper_alpha * x_hyper
+
+            # 2. Degree-based permutation: high-degree joints scan first
+            perm, inv_perm, _ = self.hyper_router(H)   # (NM, V) each
+
+            # 3. Reorder nodes before SpatialMamba
+            x_sorted = _batched_reorder_v(x_for_mamba, perm)   # (NM, C_in, T, V)
+
+            # 4. Mamba scan on degree-ordered sequence
+            f_mamba = self.mamba(x_sorted)                      # (NM, C_in, T, V)
+
+            # 5. Restore original node ordering via inverse permutation
+            f_mamba = _batched_reorder_v(f_mamba, inv_perm)     # (NM, C_in, T, V)
+        else:
+            f_mamba = self.mamba(x)                  # (N*M, C_in, T, V)
+
+        f_mamba = self.mamba_proj(f_mamba)           # (N*M, C_out, T, V)
 
         # Gate fusion
-        fused = self.fusion(f_gcn, f_mamba)  # (N*M, C_out, T, V)
+        fused = self.fusion(f_gcn, f_mamba)          # (N*M, C_out, T, V)
 
         # TCN
-        out = self.tcn(fused)                # (N*M, C_out, T', V)
+        out = self.tcn(fused)                        # (N*M, C_out, T', V)
         out = self.relu(out + res)
         return out
 
@@ -508,19 +709,24 @@ class Model(nn.Module):
     but each TCN_GCN_unit is replaced by a DualBranchBlock.
 
     Args:
-        num_class   : number of action classes
-        num_point   : number of skeleton joints (22 for SHREC17)
-        num_person  : number of persons per sample (1 for SHREC17)
-        graph       : dotted-path string to the graph class
-        graph_args  : kwargs forwarded to the graph constructor
-        in_channels : input feature channels (3 for xyz coordinates)
-        drop_out    : dropout probability (0 to disable)
-        adaptive    : use learnable adjacency in GCN
-        d_state     : Mamba SSM state dimension
-        mamba_expand: Mamba inner-dim expansion factor
+        num_class        : number of action classes
+        num_point        : number of skeleton joints (22 for SHREC17)
+        num_person       : number of persons per sample (1 for SHREC17)
+        graph            : dotted-path string to the graph class
+        graph_args       : kwargs forwarded to the graph constructor
+        in_channels      : input feature channels (3 for xyz coordinates)
+        drop_out         : dropout probability (0 to disable)
+        adaptive         : use learnable adjacency in GCN
+        d_state          : Mamba SSM state dimension
+        mamba_expand     : Mamba inner-dim expansion factor
         mamba_start_layer: enable Mamba from this layer index (1..10), inclusive
-        mamba_layers: explicit list of layer indices (1..10) that use Mamba;
-                      if provided, it overrides mamba_start_layer
+        mamba_layers     : explicit list of layer indices (1..10) that use Mamba;
+                           if provided, it overrides mamba_start_layer
+        use_hyper_order  : enable hypergraph-guided node ordering in the Mamba
+                           branch (default False – preserves original behaviour)
+        hyper_num_edges  : number of hyperedges per sample (default: num_point)
+        hyper_alpha_init : initial value of the learnable fusion coefficient α
+                           for `x_fused = x + α * x_hyper` (default 0.1)
     """
 
     TOTAL_LAYERS = 10
@@ -549,7 +755,9 @@ class Model(nn.Module):
                  graph=None, graph_args=None, in_channels=3,
                  drop_out=0, adaptive=True,
                  d_state=16, mamba_expand=2,
-                 mamba_start_layer=None, mamba_layers=None):
+                 mamba_start_layer=None, mamba_layers=None,
+                 use_hyper_order=False, hyper_num_edges=None,
+                 hyper_alpha_init=0.1):
         super(Model, self).__init__()
 
         if graph_args is None:
@@ -567,6 +775,13 @@ class Model(nn.Module):
 
         base_channel = 64
         kw = dict(adaptive=adaptive, d_state=d_state, mamba_expand=mamba_expand)
+        # Hypergraph keyword args forwarded to every DualBranchBlock
+        hyper_kw = dict(
+            use_hyper_order=use_hyper_order,
+            num_nodes=num_point,
+            hyper_num_edges=hyper_num_edges if hyper_num_edges is not None else num_point,
+            hyper_alpha_init=hyper_alpha_init,
+        )
         self.mamba_layers = sorted(self._resolve_mamba_layers(mamba_start_layer, mamba_layers))
 
         layer_specs = [
@@ -588,7 +803,7 @@ class Model(nn.Module):
                 block = DualBranchBlock(
                     in_c, out_c, A,
                     stride=stride, residual=residual,
-                    **kw)
+                    **kw, **hyper_kw)
             else:
                 block = GCNOnlyBlock(
                     in_c, out_c, A,
