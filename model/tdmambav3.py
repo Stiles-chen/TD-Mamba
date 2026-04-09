@@ -19,8 +19,10 @@ Requires: pip install mamba-ssm  (CUDA ≥ 11.6, PyTorch ≥ 1.12)
 
 Input  : (N, C, T, V, M)  –  batch, channels, time, joints, persons
 Output : (N, num_class)
+加入了手动控制哪层开始使用mamba
+加入了超图模块，用于指导mamba扫描序列
 """
-#加入时间mamba
+
 import math
 
 import numpy as np
@@ -77,43 +79,6 @@ def weights_init(m):
             m.bias.data.fill_(0)
 
 
-def _normalize_valid_lengths(valid_lengths, n, m, t, device):
-    """Normalize valid lengths to shape (N*M,) with values in [0, T]."""
-    if valid_lengths is None:
-        return None
-    if not torch.is_tensor(valid_lengths):
-        valid_lengths = torch.tensor(valid_lengths, device=device)
-    valid_lengths = valid_lengths.to(device=device, dtype=torch.long)
-
-    if valid_lengths.dim() == 1:
-        if valid_lengths.numel() != n:
-            raise ValueError("valid_lengths with dim=1 must have shape (N,)")
-        valid_lengths = valid_lengths.unsqueeze(1).expand(n, m)
-    elif valid_lengths.dim() == 2:
-        if valid_lengths.shape == (n, 1):
-            valid_lengths = valid_lengths.expand(n, m)
-        elif valid_lengths.shape != (n, m):
-            raise ValueError("valid_lengths with dim=2 must have shape (N, M) or (N, 1)")
-    else:
-        raise ValueError("valid_lengths must be None, (N,), (N,1), or (N,M)")
-
-    return valid_lengths.clamp(min=0, max=t).contiguous().view(n * m)
-
-
-def _make_temporal_mask(valid_lengths, t, device):
-    """Build boolean mask of shape (B, T): True for valid timesteps."""
-    if valid_lengths is None:
-        return None
-    time_index = torch.arange(t, device=device).unsqueeze(0)
-    return time_index < valid_lengths.unsqueeze(1)
-
-
-def _downsample_valid_lengths(valid_lengths, stride):
-    if valid_lengths is None or stride == 1:
-        return valid_lengths
-    return (valid_lengths + stride - 1) // stride
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Temporal convolution blocks (identical to tdgcn.py)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -136,63 +101,14 @@ class TemporalConv(nn.Module):
         return x
 
 
-class TemporalMambaBranch(nn.Module):
-    """Temporal branch that scans along T with bidirectional Mamba."""
-
-    def __init__(self, in_channels, out_channels, stride=1,
-                 d_state=16, d_conv=4, expand=2):
-        super().__init__()
-        self.in_proj = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-        self.ssm_fwd = Mamba(d_model=out_channels, d_state=d_state,
-                             d_conv=d_conv, expand=expand)
-        self.ssm_bwd = Mamba(d_model=out_channels, d_state=d_state,
-                             d_conv=d_conv, expand=expand)
-        self.fuse_proj = nn.Sequential(
-            nn.Linear(out_channels * 2, out_channels, bias=False),
-            nn.LayerNorm(out_channels),
-        )
-        self.out_bn = nn.BatchNorm2d(out_channels)
-        self.stride = stride
-
-    def forward(self, x, valid_lengths=None):
-        # (NM, C, T, V) -> (NM*V, T, C)
-        x = self.in_proj(x)
-        NM, C, T, V = x.shape
-        tmask = _make_temporal_mask(valid_lengths, T, x.device)
-        if tmask is not None:
-            x = x * tmask[:, None, :, None].to(dtype=x.dtype)
-
-        x_seq = x.permute(0, 3, 2, 1).contiguous().view(NM * V, T, C)
-
-        fwd = self.ssm_fwd(x_seq)
-        bwd = self.ssm_bwd(x_seq.flip(1)).flip(1)
-        y = self.fuse_proj(torch.cat([fwd, bwd], dim=-1))
-
-        # Restore to (NM, C, T, V) and apply temporal downsampling when needed.
-        y = y.view(NM, V, T, C).permute(0, 3, 2, 1).contiguous()
-        if self.stride > 1:
-            y = y[:, :, ::self.stride, :]
-            if tmask is not None:
-                tmask = tmask[:, ::self.stride]
-        if tmask is not None:
-            y = y * tmask[:, None, :, None].to(dtype=y.dtype)
-        return self.out_bn(y)
-
-
 class MultiScale_TemporalConv(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
-                 dilations=[1, 2, 3, 4], residual=True, residual_kernel_size=1,
-                 temporal_d_state=16, temporal_d_conv=4, temporal_expand=2):
+                 dilations=[1, 2, 3, 4], residual=True, residual_kernel_size=1):
         super().__init__()
         assert out_channels % (len(dilations) + 2) == 0, \
             '# out channels should be multiples of # branches'
 
         self.num_branches = len(dilations) + 2
-        self.stride = stride
         branch_channels = out_channels // self.num_branches
         if type(kernel_size) == list:
             assert len(kernel_size) == len(dilations)
@@ -217,10 +133,10 @@ class MultiScale_TemporalConv(nn.Module):
             nn.MaxPool2d(kernel_size=(3, 1), stride=(stride, 1), padding=(1, 0)),
             nn.BatchNorm2d(branch_channels)
         ))
-        self.branches.append(TemporalMambaBranch(
-            in_channels, branch_channels, stride=stride,
-            d_state=temporal_d_state, d_conv=temporal_d_conv,
-            expand=temporal_expand
+        self.branches.append(nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels, kernel_size=1, padding=0,
+                      stride=(stride, 1)),
+            nn.BatchNorm2d(branch_channels)
         ))
 
         if not residual:
@@ -232,14 +148,9 @@ class MultiScale_TemporalConv(nn.Module):
                                          kernel_size=residual_kernel_size, stride=stride)
         self.apply(weights_init)
 
-    def forward(self, x, valid_lengths=None):
+    def forward(self, x):
         res = self.residual(x)
-        branch_outs = []
-        for branch in self.branches:
-            if isinstance(branch, TemporalMambaBranch):
-                branch_outs.append(branch(x, valid_lengths=valid_lengths))
-            else:
-                branch_outs.append(branch(x))
+        branch_outs = [branch(x) for branch in self.branches]
         out = torch.cat(branch_outs, dim=1)
         out += res
         return out
@@ -485,16 +396,10 @@ class DualBranchBlock(nn.Module):
     def __init__(self, in_channels, out_channels, A,
                  stride=1, residual=True, adaptive=True,
                  kernel_size=5, dilations=None,
-                 d_state=16, mamba_expand=2,
-                 temporal_d_state=None, temporal_d_conv=4, temporal_expand=None):
+                 d_state=16, mamba_expand=2):
         super().__init__()
-        self.stride = stride
         if dilations is None:
             dilations = [1, 2]
-        if temporal_d_state is None:
-            temporal_d_state = d_state
-        if temporal_expand is None:
-            temporal_expand = mamba_expand
 
         # GCN branch
         self.gcn = unit_gcn(in_channels, out_channels, A, adaptive=adaptive)
@@ -521,10 +426,7 @@ class DualBranchBlock(nn.Module):
         self.tcn = MultiScale_TemporalConv(
             out_channels, out_channels,
             kernel_size=kernel_size, stride=stride,
-            dilations=dilations, residual=False,
-            temporal_d_state=temporal_d_state,
-            temporal_d_conv=temporal_d_conv,
-            temporal_expand=temporal_expand)
+            dilations=dilations, residual=False)
 
         # Block-level residual
         if not residual:
@@ -537,7 +439,7 @@ class DualBranchBlock(nn.Module):
 
         self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, x, valid_lengths=None):
+    def forward(self, x):
         # (N*M, C_in, T, V)
         res = self.residual(x)
 
@@ -552,9 +454,9 @@ class DualBranchBlock(nn.Module):
         fused = self.fusion(f_gcn, f_mamba)  # (N*M, C_out, T, V)
 
         # TCN
-        out = self.tcn(fused, valid_lengths=valid_lengths)  # (N*M, C_out, T', V)
+        out = self.tcn(fused)                # (N*M, C_out, T', V)
         out = self.relu(out + res)
-        return out, _downsample_valid_lengths(valid_lengths, self.stride)
+        return out
 
 
 class GCNOnlyBlock(nn.Module):
@@ -562,10 +464,8 @@ class GCNOnlyBlock(nn.Module):
 
     def __init__(self, in_channels, out_channels, A,
                  stride=1, residual=True, adaptive=True,
-                 kernel_size=5, dilations=None,
-                 temporal_d_state=16, temporal_d_conv=4, temporal_expand=2):
+                 kernel_size=5, dilations=None):
         super().__init__()
-        self.stride = stride
         if dilations is None:
             dilations = [1, 2]
 
@@ -573,10 +473,7 @@ class GCNOnlyBlock(nn.Module):
         self.tcn = MultiScale_TemporalConv(
             out_channels, out_channels,
             kernel_size=kernel_size, stride=stride,
-            dilations=dilations, residual=False,
-            temporal_d_state=temporal_d_state,
-            temporal_d_conv=temporal_d_conv,
-            temporal_expand=temporal_expand)
+            dilations=dilations, residual=False)
 
         if not residual:
             self.residual = lambda x: 0
@@ -587,11 +484,11 @@ class GCNOnlyBlock(nn.Module):
                                      kernel_size=1, stride=stride)
         self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, x, valid_lengths=None):
+    def forward(self, x):
         res = self.residual(x)
-        out = self.tcn(self.gcn(x), valid_lengths=valid_lengths)
+        out = self.tcn(self.gcn(x))
         out = self.relu(out + res)
-        return out, _downsample_valid_lengths(valid_lengths, self.stride)
+        return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -652,7 +549,6 @@ class Model(nn.Module):
                  graph=None, graph_args=None, in_channels=3,
                  drop_out=0, adaptive=True,
                  d_state=16, mamba_expand=2,
-                 temporal_d_state=None, temporal_d_conv=4, temporal_expand=None,
                  mamba_start_layer=None, mamba_layers=None):
         super(Model, self).__init__()
 
@@ -670,18 +566,7 @@ class Model(nn.Module):
         self.data_bn = nn.BatchNorm1d(num_person * in_channels * num_point)
 
         base_channel = 64
-        if temporal_d_state is None:
-            temporal_d_state = d_state
-        if temporal_expand is None:
-            temporal_expand = mamba_expand
-        kw = dict(
-            adaptive=adaptive,
-            d_state=d_state,
-            mamba_expand=mamba_expand,
-            temporal_d_state=temporal_d_state,
-            temporal_d_conv=temporal_d_conv,
-            temporal_expand=temporal_expand,
-        )
+        kw = dict(adaptive=adaptive, d_state=d_state, mamba_expand=mamba_expand)
         self.mamba_layers = sorted(self._resolve_mamba_layers(mamba_start_layer, mamba_layers))
 
         layer_specs = [
@@ -708,10 +593,7 @@ class Model(nn.Module):
                 block = GCNOnlyBlock(
                     in_c, out_c, A,
                     stride=stride, residual=residual,
-                    adaptive=adaptive,
-                    temporal_d_state=temporal_d_state,
-                    temporal_d_conv=temporal_d_conv,
-                    temporal_expand=temporal_expand)
+                    adaptive=adaptive)
             name = "l{}".format(idx)
             setattr(self, name, block)
             self.layer_names.append(name)
@@ -722,14 +604,13 @@ class Model(nn.Module):
 
         self.drop_out = nn.Dropout(drop_out) if drop_out else lambda x: x
 
-    def forward(self, x, valid_lengths=None):
+    def forward(self, x):
         # Support both (N, T, V*C) flat input and canonical (N, C, T, V, M) input
         if len(x.shape) == 3:
             N, T, VC = x.shape
             # Reshape: (N, T, V*C) → (N, C, T, V, M=1)
             x = x.view(N, T, self.num_point, -1).permute(0, 3, 1, 2).contiguous().unsqueeze(-1)
         N, C, T, V, M = x.size()
-        valid_lengths = _normalize_valid_lengths(valid_lengths, N, M, T, x.device)
 
         # BatchNorm over flattened (person, joint, channel) for each time step
         x = x.permute(0, 4, 3, 1, 2).contiguous().view(N, M * V * C, T)
@@ -737,21 +618,11 @@ class Model(nn.Module):
         x = x.view(N, M, V, C, T).permute(0, 1, 3, 4, 2).contiguous().view(N * M, C, T, V)
 
         for name in self.layer_names:
-            x, valid_lengths = getattr(self, name)(x, valid_lengths=valid_lengths)
+            x = getattr(self, name)(x)
 
         # Global average pooling over time and joints, then classify
         c_new = x.size(1)
-        if valid_lengths is None:
-            x = x.view(N, M, c_new, -1)
-            x = x.mean(3).mean(1)
-        else:
-            t_out = x.size(2)
-            x = x.view(N, M, c_new, t_out, V)
-            valid_lengths_nm = valid_lengths.view(N, M)
-            tmask = _make_temporal_mask(valid_lengths_nm.view(-1), t_out, x.device).view(N, M, t_out)
-            tmask_f = tmask.to(dtype=x.dtype).unsqueeze(2).unsqueeze(-1)
-            x_sum = (x * tmask_f).sum(dim=3).sum(dim=3)
-            denom = (tmask.sum(dim=-1).to(dtype=x.dtype).clamp(min=1.0) * float(V)).unsqueeze(-1)
-            x = (x_sum / denom).mean(1)
+        x = x.view(N, M, c_new, -1)
+        x = x.mean(3).mean(1)
         x = self.drop_out(x)
         return self.fc(x)

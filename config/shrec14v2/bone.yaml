@@ -5,7 +5,7 @@
 # feeder
 feeder: feeders.feeder_shrec17.Feeder
 train_feeder_args:
-  data_path: motion       # modality: joint | bone | motion | bone_motion
+  data_path: bone       # modality: joint | bone | motion | bone_motion
   label_path: train
   debug: False
   random_choose: True
@@ -17,7 +17,7 @@ train_feeder_args:
   label_flag: 14         # 14-class or 28-class split
 
 test_feeder_args:
-  data_path: motion
+  data_path: bone
   label_path: val
   debug: False
   label_flag: 14
@@ -43,6 +43,7 @@ model_args:
   mamba_expand: 2        # inner-dim expansion factor (d_inner = 2 * channels)
   mamba_start_layer: 5   # stage index to start Mamba (0-based; set to 0 to apply Mamba from the first stage)
 
+
   in_channels: 3         # 3-D joint coordinates (x, y, z)
   drop_out: 0.25         # dropout before classifier (helps on small datasets)
 
@@ -59,10 +60,10 @@ gate_lr_mult: 3.0
 # Training schedule
 # ─────────────────────────────────────────────────────────────────────────────
 device: 0  # GPU device index used for training and inference (single GPU)
-batch_size: 64
-test_batch_size: 64
+batch_size: 32
+test_batch_size: 32
 num_epoch: 150
 nesterov: True
 warm_up_epoch: 20
 
-work_dir: ./work_dir/shrec17/14motion
+work_dir: ./work_dir/shrec17v2/14bone
