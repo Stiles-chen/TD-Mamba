@@ -5,7 +5,7 @@ Architecture:
   - GCN branch  : unit_gcn (from tdgcn) models local joint-to-joint
                   relationships using the skeleton graph adjacency matrix.
   - Mamba branch: SpatialMamba models global spatial dependencies by
-                  scanning over the joint sequence with a bidirectional
+                  scanning over the joint sequence with a unidirectional
                   Mamba SSM (backed by the official mamba-ssm CUDA kernel).
   - Gate fusion : a learnable sigmoid gate adaptively blends the two
                   complementary feature streams.
@@ -429,7 +429,7 @@ class DegreeOrderRouter(nn.Module):
 
 class SpatialMamba(nn.Module):
     """
-    Applies a bidirectional selective SSM over the joint (spatial) dimension.
+    Applies a unidirectional selective SSM over the joint (spatial) dimension.
 
     The joint sequence order follows the SHREC17 skeleton topology: starting
     from the wrist (root), traversing each finger chain in order.  This
@@ -437,8 +437,8 @@ class SpatialMamba(nn.Module):
 
     For each frame independently:
         (N*M, C, T, V) → reshape to (N*M*T, V, C)
-                       → forward SSM + backward SSM
-                       → fuse and project
+                       → forward SSM
+                       → light projection
                        → reshape back to (N*M, C, T, V)
 
     Args:
@@ -455,11 +455,9 @@ class SpatialMamba(nn.Module):
         # output projection and residual – all fused in a single CUDA kernel.
         self.ssm_fwd = Mamba(d_model=channels, d_state=d_state,
                              d_conv=d_conv, expand=expand)
-        self.ssm_bwd = Mamba(d_model=channels, d_state=d_state,
-                             d_conv=d_conv, expand=expand)
-        # Fuse forward and backward outputs
+        # Keep a light post projection for feature calibration.
         self.fuse_proj = nn.Sequential(
-            nn.Linear(channels * 2, channels, bias=False),
+            nn.Linear(channels, channels, bias=False),
             nn.LayerNorm(channels),
         )
 
@@ -475,10 +473,7 @@ class SpatialMamba(nn.Module):
         x_seq = x.permute(0, 2, 3, 1).contiguous().view(NM * T, V, C)
 
         fwd = self.ssm_fwd(x_seq)                     # (NM*T, V, C)
-        bwd = self.ssm_bwd(x_seq.flip(1)).flip(1)     # reverse and un-reverse
-
-        # Fuse bidirectional outputs
-        y = self.fuse_proj(torch.cat([fwd, bwd], dim=-1))  # (NM*T, V, C)
+        y = self.fuse_proj(fwd)                       # (NM*T, V, C)
 
         # Restore original tensor layout
         y = y.view(NM, T, V, C).permute(0, 3, 1, 2).contiguous()  # (NM, C, T, V)

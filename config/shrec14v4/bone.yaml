@@ -1,0 +1,73 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration for the Dual-Branch GCN + Mamba model on SHREC17
+# ─────────────────────────────────────────────────────────────────────────────
+
+# feeder
+feeder: feeders.feeder_shrec17.Feeder
+train_feeder_args:
+  data_path: bone       # modality: joint | bone | motion | bone_motion
+  label_path: train
+  debug: False
+  random_choose: True
+  random_shift: False
+  random_move: False
+  window_size: 180       # max sequence length for SHREC17
+  normalization: False
+  repeat: 5              # training-set repetition for augmentation
+  label_flag: 14         # 14-class or 28-class split
+
+test_feeder_args:
+  data_path: bone
+  label_path: val
+  debug: False
+  label_flag: 14
+  random_choose: False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model: Dual-Branch GCN + Mamba (drop-in replacement for model.tdgcn.Model)
+# ─────────────────────────────────────────────────────────────────────────────
+model: model.tdmambav3.Model
+model_args:
+  num_class: 14          # 28-class SHREC17 (change to 14 for 14-class split)
+  num_point: 22          # SHREC17 skeleton has 22 hand joints
+  num_person: 1          # single-person gesture dataset
+  graph: graph.shrec17.Graph
+  graph_args:
+    labeling_mode: 'spatial'
+
+  # GCN settings
+  adaptive: True         # learnable adjacency matrix in GCN branch
+
+  # Mamba settings
+  d_state: 16            # SSM state dimension; increase to 32 for richer model
+  mamba_expand: 1        # inner-dim expansion factor (d_inner = 2 * channels)
+  mamba_start_layer: 8   # stage index to start Mamba (0-based; set to 0 to apply Mamba from the first stage)
+
+
+  in_channels: 3         # 3-D joint coordinates (x, y, z)
+  drop_out: 0.25         # dropout before classifier (helps on small datasets)
+
+  use_hyper_order: True        # ← 开关：True 开启超图引导节点排序
+  hyper_num_edges: 17          # ← 超图边数 E（默认等于 num_point，即 22）
+  hyper_alpha_init: 0.1        # ← 超图特征融合系数 α 的初始值（残差融合强度）
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Optimiser
+# ─────────────────────────────────────────────────────────────────────────────
+weight_decay: 0.0001
+base_lr: 0.1
+lr_decay_rate: 0.1
+step: [90, 130]          # epoch milestones for LR decay
+gate_lr_mult: 3.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training schedule
+# ─────────────────────────────────────────────────────────────────────────────
+device: 0  # GPU device index used for training and inference (single GPU)
+batch_size: 32
+test_batch_size: 32
+num_epoch: 150
+nesterov: True
+warm_up_epoch: 20
+
+work_dir: ./work_dir/shrec17v4/14bone

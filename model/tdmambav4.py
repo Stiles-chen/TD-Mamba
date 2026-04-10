@@ -692,6 +692,76 @@ class GCNOnlyBlock(nn.Module):
         return out
 
 
+class MambaOnlyBlock(nn.Module):
+    """Mamba+TCN block without a GCN branch (used for l10)."""
+
+    def __init__(self, in_channels, out_channels,
+                 stride=1, residual=True,
+                 kernel_size=5, dilations=None,
+                 d_state=16, mamba_expand=2,
+                 use_hyper_order=True, num_nodes=25,
+                 hyper_num_edges=7, hyper_alpha_init=0.1):
+        super().__init__()
+        if dilations is None:
+            dilations = [1, 2]
+
+        self.use_hyper_order = use_hyper_order
+
+        if use_hyper_order:
+            if hyper_num_edges is None:
+                hyper_num_edges = num_nodes
+            self.hyper_conv = HyperGraphConvLite(
+                in_channels, num_nodes, hyper_num_edges)
+            self.hyper_router = DegreeOrderRouter()
+            self.hyper_alpha = nn.Parameter(
+                torch.tensor(hyper_alpha_init, dtype=torch.float32))
+
+        self.mamba = SpatialMamba(in_channels, d_state=d_state,
+                                  expand=mamba_expand)
+
+        if in_channels != out_channels:
+            self.mamba_proj = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            self.mamba_proj = nn.Identity()
+
+        self.tcn = MultiScale_TemporalConv(
+            out_channels, out_channels,
+            kernel_size=kernel_size, stride=stride,
+            dilations=dilations, residual=False)
+
+        if not residual:
+            self.residual = lambda x: 0
+        elif (in_channels == out_channels) and (stride == 1):
+            self.residual = lambda x: x
+        else:
+            self.residual = unit_tcn(in_channels, out_channels,
+                                     kernel_size=1, stride=stride)
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        res = self.residual(x)
+
+        if self.use_hyper_order:
+            x_hyper, H = self.hyper_conv(x)
+            x_for_mamba = x + self.hyper_alpha * x_hyper
+            perm, inv_perm, _ = self.hyper_router(H)
+            x_sorted = _batched_reorder_v(x_for_mamba, perm)
+            f_mamba = self.mamba(x_sorted)
+            f_mamba = _batched_reorder_v(f_mamba, inv_perm)
+        else:
+            f_mamba = self.mamba(x)
+
+        f_mamba = self.mamba_proj(f_mamba)
+        out = self.tcn(f_mamba)
+        out = self.relu(out + res)
+        return out
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Full model
 # ──────────────────────────────────────────────────────────────────────────────
@@ -799,7 +869,14 @@ class Model(nn.Module):
 
         self.layer_names = []
         for idx, (in_c, out_c, stride, residual) in enumerate(layer_specs, start=1):
-            if idx in self.mamba_layers:
+            if idx == 10 and idx in self.mamba_layers:
+                # Remove the GCN branch at l10 and keep a Mamba-only block.
+                block = MambaOnlyBlock(
+                    in_c, out_c,
+                    stride=stride, residual=residual,
+                    d_state=d_state, mamba_expand=mamba_expand,
+                    **hyper_kw)
+            elif idx in self.mamba_layers:
                 block = DualBranchBlock(
                     in_c, out_c, A,
                     stride=stride, residual=residual,
