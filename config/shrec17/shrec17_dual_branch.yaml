@@ -1,0 +1,66 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration for the Dual-Branch GCN + Mamba model on SHREC17
+# ─────────────────────────────────────────────────────────────────────────────
+
+# feeder
+feeder: feeders.feeder_shrec17.Feeder
+train_feeder_args:
+  data_path: joint       # modality: joint | bone | motion | bone_motion
+  label_path: train
+  debug: False
+  random_choose: True
+  random_shift: False
+  random_move: False
+  window_size: 180       # max sequence length for SHREC17
+  normalization: False
+  repeat: 5              # training-set repetition for augmentation
+  label_flag: 28         # 14-class or 28-class split
+
+test_feeder_args:
+  data_path: joint
+  label_path: val
+  debug: False
+  label_flag: 28
+  random_choose: False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model: Dual-Branch GCN + Mamba (drop-in replacement for model.tdgcn.Model)
+# ─────────────────────────────────────────────────────────────────────────────
+model: model.dual_branch_mamba.Model
+model_args:
+  num_class: 28          # 28-class SHREC17 (change to 14 for 14-class split)
+  num_point: 22          # SHREC17 skeleton has 22 hand joints
+  num_person: 1          # single-person gesture dataset
+  graph: graph.shrec17.Graph
+  graph_args:
+    labeling_mode: 'spatial'
+
+  # GCN settings
+  adaptive: True         # learnable adjacency matrix in GCN branch
+
+  # Mamba settings
+  d_state: 16            # SSM state dimension; increase to 32 for richer model
+  mamba_expand: 2        # inner-dim expansion factor (d_inner = 2 * channels)
+
+  in_channels: 3         # 3-D joint coordinates (x, y, z)
+  drop_out: 0.25         # dropout before classifier (helps on small datasets)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Optimiser
+# ─────────────────────────────────────────────────────────────────────────────
+weight_decay: 0.0001
+base_lr: 0.1
+lr_decay_rate: 0.1
+step: [90, 130]          # epoch milestones for LR decay
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training schedule
+# ─────────────────────────────────────────────────────────────────────────────
+device: 4  # GPU device index used for training and inference (single GPU)
+batch_size: 32
+test_batch_size: 32
+num_epoch: 150
+nesterov: True
+warm_up_epoch: 20
+
+work_dir: ./work_dir/shrec17/28joint_dual_branch
